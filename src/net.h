@@ -193,7 +193,7 @@ class CNodeStats
 public:
     NodeId nodeid;
     uint64_t nServices;
-    bool fTLSHandshakeComplete;
+    bool fTLSEstablished;
     int64_t nLastSend;
     int64_t nLastRecv;
     int64_t nTimeConnected;
@@ -261,15 +261,12 @@ class CNode
 {
 public:
     // OpenSSL
-    BIO *sbio;
-    SSL_CTX *ctx;
     SSL *ssl;
-    bool server_side;
-    bool establish_tls_connection(bool contextonly=false);
-
+    
     // socket
     uint64_t nServices;
     SOCKET hSocket;
+    CCriticalSection cs_hSocket;
     CDataStream ssSend;
     size_t nSendSize; // total size of all vSendMsg entries
     size_t nSendOffset; // offset inside the first vSendMsg already sent
@@ -282,7 +279,6 @@ public:
     CCriticalSection cs_vRecvMsg;
     uint64_t nRecvBytes;
     int nRecvVersion;
-    bool fTLSHandshakeComplete;
 
     int64_t nLastSend;
     int64_t nLastRecv;
@@ -360,7 +356,7 @@ public:
     // Whether a ping is requested.
     bool fPingQueued;
 
-    CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNameIn = "", bool fInboundIn = false);
+    CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNameIn = "", bool fInboundIn = false, SSL *sslIn = NULL);
     ~CNode();
 
 private:
