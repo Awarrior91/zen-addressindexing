@@ -94,7 +94,6 @@ static boost::filesystem::path tlsKeyPath;
 static boost::filesystem::path tlsCertPath;
 
 // OpenSSL related variables for metrics.cpp
-static std::string tlsvalidate;
 static std::string routingsecrecy;
 static std::string cipherdescription;
 static std::string securitylevel;
@@ -179,6 +178,9 @@ extern CCriticalSection cs_vAddedNodes;
 extern NodeId nLastNodeId;
 extern CCriticalSection cs_nLastNodeId;
 
+extern SSL_CTX *tls_ctx_server;
+extern SSL_CTX *tls_ctx_client;
+
 struct LocalServiceInfo {
     int nScore;
     int nPort;
@@ -194,6 +196,7 @@ public:
     NodeId nodeid;
     uint64_t nServices;
     bool fTLSEstablished;
+    bool fTLSVerified;
     int64_t nLastSend;
     int64_t nLastRecv;
     int64_t nTimeConnected;

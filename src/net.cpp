@@ -59,15 +59,8 @@
 #define USE_TLS
 #define COMPAT_NON_TLS // enables compatibility with nodes, that still doesn't support TLS connections
 
-//#define EXTENDED_INFO
-
-#ifdef EXTENDED_INFO
-#define DBGPRINT LogPrintf
-#else
-#define DBGPRINT
-#endif
-
 typedef enum {sslAccept, sslConnect, sslShutdown} SSLConnectionRoutine;
+typedef enum {clientContext, serverContext} TLSContextType;
 
 using namespace std;
 
@@ -131,21 +124,21 @@ typedef struct _NODE_ADDR
 {
     std::string ipAddr;
     int64_t time;           // time in msec, of an attempt to connect via TLS
-    
+
     _NODE_ADDR(std::string _ipAddr, int64_t _time = 0) : ipAddr(_ipAddr), time(_time){}
 } NODE_ADDR, *PNODE_ADDR;
 
 
-bool operator==(_NODE_ADDR a, _NODE_ADDR b)
+static bool operator==(_NODE_ADDR a, _NODE_ADDR b)
 {
     return (a.ipAddr == b.ipAddr);
 }
 
-std::vector<NODE_ADDR> vNonTLSNodesInbound;
-CCriticalSection cs_vNonTLSNodesInbound;
+static std::vector<NODE_ADDR> vNonTLSNodesInbound;
+static CCriticalSection cs_vNonTLSNodesInbound;
 
-std::vector<NODE_ADDR> vNonTLSNodesOutbound;
-CCriticalSection cs_vNonTLSNodesOutbound;
+static std::vector<NODE_ADDR> vNonTLSNodesOutbound;
+static CCriticalSection cs_vNonTLSNodesOutbound;
 
 void AddOneShot(const std::string& strDest)
 {
@@ -401,7 +394,7 @@ CNode* FindNode(const CService& addr)
 
 #ifdef USE_TLS
 
-int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeoutSec)
+static int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeoutSec)
 {
     int nErr = 0;
 
@@ -412,19 +405,19 @@ int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeout
             case sslConnect:
                 nErr = SSL_connect(ssl);
                 break;
-                
+
             case sslAccept:
                 nErr = SSL_accept(ssl);
                 break;
-                
+
             case sslShutdown:
                 nErr = SSL_shutdown(ssl);
                 break;
-                
+
             default:
                 return -1;
         }
-        
+
         if (eRoutine == sslShutdown)
         {
             if (nErr >= 0)
@@ -435,12 +428,12 @@ int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeout
             if (nErr == 1)
                 break;
         }
-        
+
         int sslErr = SSL_get_error(ssl, nErr);
 
         if (sslErr != SSL_ERROR_WANT_READ && sslErr != SSL_ERROR_WANT_WRITE)
         {
-            LogPrintf("ERROR: %s: %s: ssl_err_code: %s; errno: %s\n", __FILE__, __func__, ERR_error_string(sslErr, NULL), strerror(errno));
+            LogPrintf("TLS: ERROR: %s: %s: ssl_err_code: %s; errno: %s\n", __FILE__, __func__, ERR_error_string(sslErr, NULL), strerror(errno));
             nErr = -1;
             break;
         }
@@ -456,13 +449,13 @@ int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeout
             int result = select(hSocket + 1, &socketSet, NULL, NULL, &timeout);
             if (result == 0)
             {
-                LogPrintf("ERROR: %s: %s: WANT_READ timeout\n", __FILE__, __func__);
+                LogPrint("net", "TLS: ERROR: %s: %s: WANT_READ timeout\n", __FILE__, __func__);
                 nErr = -1;
                 break;
             }
             else if (result == -1)
             {
-                LogPrintf("ERROR: %s: %s: WANT_READ ssl_err_code: %s; errno: %s\n", __FILE__, __func__, ERR_error_string(sslErr, NULL), strerror(errno));
+                LogPrint("net", "TLS: ERROR: %s: %s: WANT_READ ssl_err_code: %s; errno: %s\n", __FILE__, __func__, ERR_error_string(sslErr, NULL), strerror(errno));
                 nErr = -1;
                 break;
             }
@@ -472,13 +465,13 @@ int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeout
             int result = select(hSocket + 1, NULL, &socketSet, NULL, &timeout);
             if (result == 0)
             {
-                LogPrintf("ERROR: %s: %s: WANT_WRITE timeout\n", __FILE__, __func__);
+                LogPrint("net", "TLS: ERROR: %s: %s: WANT_WRITE timeout\n", __FILE__, __func__);
                 nErr = -1;
                 break;
             }
             else if (result == -1)
             {
-                LogPrintf("ERROR: %s: %s: WANT_WRITE ssl_err_code: %s; errno: %s\n", __FILE__, __func__, ERR_error_string(sslErr, NULL), strerror(errno));
+                LogPrint("net", "TLS: ERROR: %s: %s: WANT_WRITE ssl_err_code: %s; errno: %s\n", __FILE__, __func__, ERR_error_string(sslErr, NULL), strerror(errno));
                 nErr = -1;
                 break;
             }
@@ -488,57 +481,30 @@ int WaitFor(SSLConnectionRoutine eRoutine, SOCKET hSocket, SSL *ssl, int timeout
     return nErr;
 }
 
-SSL* ConnectByTLS(SOCKET hSocket, CAddress &addrConnect)
+static SSL* TLSConnect(SOCKET hSocket, const CAddress &addrConnect)
 {
-    DBGPRINT ("TLS: establishing connection (tid = %X)\n", pthread_self());
-    
+    LogPrint("net", "TLS: establishing connection (tid = %X), (peerid = %s)\n", pthread_self(), addrConnect.ToString());
+
     SSL *ssl = NULL;
     bool bConnectedTLS = false;
-//    bool bEstablishedTLS = false;
-    
+
     if ((ssl = SSL_new(tls_ctx_client)))
     {
         if (SSL_set_fd(ssl, hSocket))
         {
-//            int sslErr = SSL_get_error(ssl, SSL_connect(ssl));
-//
-//            if (sslErr == SSL_ERROR_NONE || sslErr == SSL_ERROR_WANT_WRITE || sslErr == SSL_ERROR_WANT_READ)
-//            {
-//                bConnectedTLS = true;
-//
-//                if (sslErr == SSL_ERROR_NONE)
-//                    bEstablishedTLS = true;
-//            }
-//            else
-//            {
-//                LogPrintf ("ERROR: %s: %s: SSL_connect failed\n", __FILE__, __func__);
-//            }
-            
-            int nErr = 0;
             if (WaitFor(sslConnect, hSocket, ssl, (DEFAULT_CONNECT_TIMEOUT / 1000)) == 1)
-            {
                 bConnectedTLS = true;
-            }
-            else
-            {
-                LogPrintf ("ERROR: %s: %s: SSL_connect failed\n", __FILE__, __func__);
-            }
         }
-        else
-            LogPrintf ("ERROR: %s: %s: SSL_set_fd failed\n", __FILE__, __func__);
     }
-    else
-        LogPrintf ("ERROR: %s: %s: SSL_new failed\n", __FILE__, __func__);
-    
+
     if (bConnectedTLS)
     {
-//        LogPrintf ("TLS: connection to %s has been established. Using cipher: %s\n", addrConnect.ToString(), bEstablishedTLS ? SSL_get_cipher(ssl) : "Cipher will be defined later");
         LogPrintf ("TLS: connection to %s has been established. Using cipher: %s\n", addrConnect.ToString(), SSL_get_cipher(ssl));
     }
     else
     {
-        LogPrintf ("ERROR: %s: %s: TLS connection to %s failed\n", __FILE__, __func__, addrConnect.ToString());
-        
+        LogPrintf ("TLS: ERROR: %s: %s: TLS connection to %s failed\n", __FILE__, __func__, addrConnect.ToString());
+
         if (ssl)
         {
             SSL_free(ssl);
@@ -585,21 +551,21 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
         addrman.Attempt(addrConnect);
 
         SSL *ssl = NULL;
-        
+
 #ifdef USE_TLS
         /* TCP connection is ready. Do client side SSL. */
 #ifdef COMPAT_NON_TLS
         {
             LOCK(cs_vNonTLSNodesOutbound);
-        
+
             NODE_ADDR nodeAddr(addrConnect.ToStringIP());
-        
+
             bool bUseTLS = (find(vNonTLSNodesOutbound.begin(),
                                  vNonTLSNodesOutbound.end(),
                                  nodeAddr) == vNonTLSNodesOutbound.end());
             if (bUseTLS)
             {
-                ssl = ConnectByTLS(hSocket, addrConnect);
+                ssl = TLSConnect(hSocket, addrConnect);
                 if (!ssl)
                 {
                     // Further reconnection will be made in non-TLS (unencrypted) mode
@@ -611,7 +577,7 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
             else
             {
                 LogPrintf ("Connection to %s will be unencrypted\n", addrConnect.ToString());
-        
+
                 vNonTLSNodesOutbound.erase(
                         remove(
                                 vNonTLSNodesOutbound.begin(),
@@ -621,13 +587,26 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
             }
         }
 #else
-        ssl = ConnectByTLS(hSocket, addrConnect);
+        ssl = TLSConnect(hSocket, addrConnect);
         if(!ssl)
         {
             CloseSocket(hSocket);
             return NULL;
         }
 #endif  // COMPAT_NON_TLS
+
+        if (GetBoolArg("-tlsvalidate", false))
+        {
+            if (ssl && !ValidatePeerCertificate(ssl))
+            {
+                LogPrintf ("TLS: ERROR: Wrong server certificate from %s. Connection will be closed.\n", addrConnect.ToString());
+
+                SSL_shutdown(ssl);
+                CloseSocket(hSocket);
+                SSL_free(ssl);
+                return NULL;
+            }
+        }
 #endif  // USE_TLS
 
         // Add node
@@ -654,22 +633,22 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
 void CNode::CloseSocketDisconnect()
 {
     fDisconnect = true;
-    
+
     {
         LOCK(cs_hSocket);
-        
+
         if (hSocket != INVALID_SOCKET)
         {
             LogPrint("net", "disconnecting peer=%d\n", id);
-        
+
             if (ssl)
             {
                 WaitFor(sslShutdown, hSocket, ssl, (DEFAULT_CONNECT_TIMEOUT / 1000));
-                
+
                 SSL_free(ssl);
                 ssl = NULL;
             }
-            
+
             CloseSocket(hSocket);
         }
     }
@@ -834,6 +813,7 @@ void CNode::copyStats(CNodeStats &stats)
     {
         LOCK(cs_hSocket);
         stats.fTLSEstablished = (ssl != NULL) && (SSL_get_state(ssl) == TLS_ST_OK);
+        stats.fTLSVerified = (ssl != NULL) && ValidatePeerCertificate(ssl);
     }
 }
 #undef X
@@ -935,9 +915,6 @@ int CNetMessage::readData(const char *pch, unsigned int nBytes)
 // requires LOCK(cs_vSend)
 void SocketSendData(CNode *pnode)
 {
-    DBGPRINT("-------------------------------------- S\n");
-    DBGPRINT("Sending data to %s (tid = %X)\n", pnode->addr.ToString(), pthread_self());
-
     std::deque<CSerializeData>::iterator it = pnode->vSendMsg.begin();
 
     while (it != pnode->vSendMsg.end())
@@ -947,18 +924,18 @@ void SocketSendData(CNode *pnode)
 
         bool bIsSSL = false;
         int nBytes = 0, nRet = 0;
-        
+
         {
             LOCK(pnode->cs_hSocket);
-            
+
             if (pnode->hSocket == INVALID_SOCKET)
             {
-                LogPrintf("Send: connection with %s is already closed\n", pnode->addr.ToString());
+                LogPrint("net", "Send: connection with %s is already closed\n", pnode->addr.ToString());
                 break;
             }
-    
+
             bIsSSL = (pnode->ssl != NULL);
-            
+
             if (bIsSSL)
             {
                 nBytes = SSL_write(pnode->ssl, &data[pnode->nSendOffset], data.size() - pnode->nSendOffset);
@@ -988,7 +965,6 @@ void SocketSendData(CNode *pnode)
                 // could not send full message; stop sending more
                 break;
             }
-            DBGPRINT("Sent %d bytes (%d)\n", nBytes, nRet);
         }
         else
         {
@@ -1005,8 +981,6 @@ void SocketSendData(CNode *pnode)
                     }
                     else
                     {
-                        DBGPRINT("TLS: SSL_write WANT_READ/WANT_WRITE: %s\n", ERR_error_string(nRet, NULL));
-
                         // preventive measure from exhausting CPU usage
                         //
                         MilliSleep(1);    // 1 msec
@@ -1022,8 +996,6 @@ void SocketSendData(CNode *pnode)
                 }
             }
 
-            DBGPRINT("Couldn't send anything\n");
-
             // couldn't send anything at all
             break;
         }
@@ -1035,8 +1007,6 @@ void SocketSendData(CNode *pnode)
         assert(pnode->nSendSize == 0);
     }
     pnode->vSendMsg.erase(pnode->vSendMsg.begin(), it);
-
-    DBGPRINT("-------------------------------------- E\n");
 }
 
 static list<CNode*> vNodesDisconnected;
@@ -1197,64 +1167,37 @@ static bool AttemptToEvictConnection(bool fPreferNewConnection) {
 
 #ifdef USE_TLS
 
-SSL* AcceptByTLS(SOCKET hSocket, CAddress &addr)
+static SSL* TLSAccept(SOCKET hSocket, const CAddress &addr)
 {
-    DBGPRINT ("TLS: accepting connection from %s (tid = %X)\n", addr.ToString(), pthread_self());
-    
+    LogPrint("net", "TLS: accepting connection from %s (tid = %X)\n", addr.ToString(), pthread_self());
+
     SSL *ssl = NULL;
     bool bAcceptedTLS = false;
-//    bool bEstablishedTLS = false;
-    
+
     if ((ssl = SSL_new(tls_ctx_server)))
     {
         if (SSL_set_fd(ssl, hSocket))
         {
-//            int sslErr = SSL_get_error(ssl, SSL_accept(ssl));
-//
-//            if (sslErr == SSL_ERROR_NONE || sslErr == SSL_ERROR_WANT_WRITE || sslErr == SSL_ERROR_WANT_READ)
-//            {
-//                bAcceptedTLS = true;
-//
-//                if (sslErr == SSL_ERROR_NONE)
-//                    bEstablishedTLS = true;
-//            }
-//            else
-//            {
-//                LogPrintf ("ERROR: %s: %s: SSL_accept failed\n", __FILE__, __func__);
-//            }
-            
-            int nErr = 0;
-            if ((nErr = WaitFor(sslAccept, hSocket, ssl, (DEFAULT_CONNECT_TIMEOUT / 1000))) == 1)
-            {
+            if (WaitFor(sslAccept, hSocket, ssl, (DEFAULT_CONNECT_TIMEOUT / 1000)) == 1)
                 bAcceptedTLS = true;
-            }
-            else
-            {
-                LogPrintf ("ERROR: %s: %s: SSL_accept failed\n", __FILE__, __func__);
-            }
         }
-        else
-            LogPrintf ("ERROR: %s: %s: SSL_set_fd failed\n", __FILE__, __func__);
     }
-    else
-        LogPrintf ("ERROR: %s: %s: SSL_new failed\n", __FILE__, __func__);
-    
+
     if (bAcceptedTLS)
     {
-//        LogPrintf ("TLS: connection from %s has been accepted. Using_cipher: %s\n", addr.ToString(), bEstablishedTLS ? SSL_get_cipher(ssl) : "Cipher will be defined later");
-        LogPrintf ("TLS: connection from %s has been accepted. Using_cipher: %s\n", addr.ToString(), SSL_get_cipher(ssl));
+        LogPrintf ("TLS: connection from %s has been accepted. Using cipher: %s\n", addr.ToString(), SSL_get_cipher(ssl));
     }
     else
     {
-        LogPrintf ("ERROR: %s: %s: TLS connection from %s failed\n", __FILE__, __func__, addr.ToString());
-        
+        LogPrintf ("TLS: ERROR: %s: %s: TLS connection from %s failed\n", __FILE__, __func__, addr.ToString());
+
         if (ssl)
         {
             SSL_free(ssl);
             ssl = NULL;
         }
     }
-    
+
     return ssl;
 }
 
@@ -1320,25 +1263,25 @@ static void AcceptConnection(const ListenSocket& hListenSocket) {
 #else
     setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (void*)&set, sizeof(int));
 #endif
-    
+
     SSL *ssl = NULL;
-    
+
     SetSocketNonBlocking(hSocket, true);
-    
+
 #ifdef USE_TLS
     /* TCP connection is ready. Do server side SSL. */
 #ifdef COMPAT_NON_TLS
     {
         LOCK(cs_vNonTLSNodesInbound);
-    
+
         NODE_ADDR nodeAddr(addr.ToStringIP());
-        
+
         bool bUseTLS = (find(vNonTLSNodesInbound.begin(),
                              vNonTLSNodesInbound.end(),
                              nodeAddr) == vNonTLSNodesInbound.end());
         if (bUseTLS)
         {
-            ssl = AcceptByTLS(hSocket, addr);
+            ssl = TLSAccept(hSocket, addr);
             if(!ssl)
             {
                 // Further reconnection will be made in non-TLS (unencrypted) mode
@@ -1349,8 +1292,8 @@ static void AcceptConnection(const ListenSocket& hListenSocket) {
         }
         else
         {
-            LogPrintf ("Connection from %s will be unencrypted\n", addr.ToString());
-            
+            LogPrintf ("TLS: Connection from %s will be unencrypted\n", addr.ToString());
+
             vNonTLSNodesInbound.erase(
                     remove(
                             vNonTLSNodesInbound.begin(),
@@ -1361,13 +1304,26 @@ static void AcceptConnection(const ListenSocket& hListenSocket) {
         }
     }
 #else
-    ssl = AcceptByTLS(hSocket, addr);
+    ssl = TLSAccept(hSocket, addr);
     if(!ssl)
     {
         CloseSocket(hSocket);
         return;
     }
 #endif // COMPAT_NON_TLS
+
+    if (GetBoolArg("-tlsvalidate", false))
+    {
+        if (ssl && !ValidatePeerCertificate(ssl))
+        {
+            LogPrintf ("TLS: ERROR: Wrong client certificate from %s. Connection will be closed.\n", addr.ToString());
+
+            SSL_shutdown(ssl);
+            CloseSocket(hSocket);
+            SSL_free(ssl);
+            return;
+        }
+    }
 #endif // USE_TLS
 
     CNode* pnode = new CNode(hSocket, addr, "", true, ssl);
@@ -1382,28 +1338,27 @@ static void AcceptConnection(const ListenSocket& hListenSocket) {
 
 #if defined(USE_TLS) && defined(COMPAT_NON_TLS)
 
-bool IsNonTLSAddr(string strAddr, vector<NODE_ADDR> &vPool, CCriticalSection &cs)
+static bool IsNonTLSAddr(const string &strAddr, const vector<NODE_ADDR> &vPool, CCriticalSection &cs)
 {
     LOCK(cs);
     return (find(vPool.begin(), vPool.end(), NODE_ADDR(strAddr)) != vPool.end());
 }
 
-void CleanNonTLSPool(std::vector<NODE_ADDR> &vPool, CCriticalSection &cs)
+static void CleanNonTLSPool(std::vector<NODE_ADDR> &vPool, CCriticalSection &cs)
 {
     LOCK(cs);
-    
+
     vector<NODE_ADDR> vDeleted;
-    
+
     BOOST_FOREACH(NODE_ADDR nodeAddr, vPool)
     {
         if ((GetTimeMillis() - nodeAddr.time) >= 900000)
         {
-            DBGPRINT ("Node %s is deleted from the non-TLS pool\n", nodeAddr.ipAddr);
-
             vDeleted.push_back(nodeAddr);
+            LogPrint("net", "TLS: Node %s is deleted from the non-TLS pool\n", nodeAddr.ipAddr);
         }
     }
-    
+
     BOOST_FOREACH(NODE_ADDR nodeAddrDeleted, vDeleted)
     {
         vPool.erase(
@@ -1522,10 +1477,10 @@ void ThreadSocketHandler()
             BOOST_FOREACH(CNode* pnode, vNodes)
             {
                 LOCK(pnode->cs_hSocket);
-                
+
                 if (pnode->hSocket == INVALID_SOCKET)
                     continue;
-                
+
                 FD_SET(pnode->hSocket, &fdsetError);
                 hSocketMax = max(hSocketMax, pnode->hSocket);
                 have_fds = true;
@@ -1609,44 +1564,41 @@ void ThreadSocketHandler()
             // Receive
             //
             bool recvSet = false, sendSet = false, errorSet = false;
-            
+
             {
                 LOCK(pnode->cs_hSocket);
-                
+
                 if (pnode->hSocket == INVALID_SOCKET)
                     continue;
-    
+
                 recvSet  = FD_ISSET(pnode->hSocket, &fdsetRecv);
                 sendSet  = FD_ISSET(pnode->hSocket, &fdsetSend);
                 errorSet = FD_ISSET(pnode->hSocket, &fdsetError);
             }
-            
+
             if (recvSet || errorSet)
             {
                 TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
                 if (lockRecv)
                 {
                     {
-                        DBGPRINT("-------------------------------------- S\n");
-                        DBGPRINT("Reading data from %s (tid = %X)\n", pnode->addr.ToString(), pthread_self());
-
                         // typical socket buffer is 8K-64K
                         // maximum record size is 16kB for SSLv3/TLSv1
                         char pchBuf[0x10000];
                         bool bIsSSL = false;
                         int  nBytes = 0, nRet = 0;
-    
+
                         {
                             LOCK(pnode->cs_hSocket);
-    
+
                             if (pnode->hSocket == INVALID_SOCKET)
                             {
-                                LogPrintf("Receive: connection with %s is already closed\n", pnode->addr.ToString());
+                                LogPrint("net", "Receive: connection with %s is already closed\n", pnode->addr.ToString());
                                 continue;
                             }
-    
+
                             bIsSSL = (pnode->ssl != NULL);
-                            
+
                             if (bIsSSL)
                             {
                                 nBytes = SSL_read(pnode->ssl, pchBuf, sizeof(pchBuf));
@@ -1666,15 +1618,13 @@ void ThreadSocketHandler()
                             pnode->nLastRecv = GetTime();
                             pnode->nRecvBytes += nBytes;
                             pnode->RecordBytesRecv(nBytes);
-
-                            DBGPRINT("Read %d bytes\n", nBytes);
                         }
                         else if (nBytes == 0)
                         {
                             // socket closed gracefully (peer disconnected)
                             //
                             if (!pnode->fDisconnect)
-                                LogPrintf("socket closed (%s)\n", pnode->addr.ToString());
+                                LogPrint("net", "socket closed (%s)\n", pnode->addr.ToString());
                             pnode->CloseSocketDisconnect();
                         }
                         else if (nBytes < 0)
@@ -1691,8 +1641,6 @@ void ThreadSocketHandler()
                                 }
                                 else
                                 {
-                                    DBGPRINT("TLS: SSL_read WANT_READ/WANT_WRITE: %s\n", ERR_error_string(nRet, NULL));
-
                                     // preventive measure from exhausting CPU usage
                                     //
                                     MilliSleep(1); // 1 msec
@@ -1708,7 +1656,6 @@ void ThreadSocketHandler()
                                 }
                             }
                         }
-                        DBGPRINT("-------------------------------------- E\n");
                     }
                 }
             }
@@ -1980,7 +1927,7 @@ void ThreadOpenConnections()
             {
                 CAddress addr;
                 OpenNetworkConnection(addr, NULL, strAddr.c_str());
-                
+
                 for (int i = 0; i < 10 && i < nLoop; i++)
                 {
                     MilliSleep(500);
@@ -2153,22 +2100,22 @@ bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOu
             return false;
     } else if (FindNode(std::string(pszDest)))
         return false;
-    
+
     CNode* pnode = ConnectNode(addrConnect, pszDest);
     boost::this_thread::interruption_point();
-    
+
 #if defined(USE_TLS) && defined(COMPAT_NON_TLS)
-    
+
     if (!pnode)
     {
         string strDest;
         int port;
-    
+
         if (!pszDest)
             strDest = addrConnect.ToStringIP();
         else
             SplitHostPort(string(pszDest), port, strDest);
-    
+
         if (IsNonTLSAddr(strDest, vNonTLSNodesOutbound, cs_vNonTLSNodesOutbound))
         {
             // Attempt to reconnect in non-TLS mode
@@ -2176,9 +2123,9 @@ bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOu
             boost::this_thread::interruption_point();
         }
     }
-    
+
 #endif
-    
+
     if (!pnode)
         return false;
     if (grantOutbound)
@@ -2418,41 +2365,65 @@ void static Discover(boost::thread_group& threadGroup)
 #endif
 }
 
-// Lightweight initialization of basic parameters, needed for TLS running; will be extended.
-//
-SSL_CTX* InitServerTLSCtx()
-{
-    SSL_CTX *tlsCtx = NULL;
-    bool bInitialized = false;
-    
-    string certificateFile = (GetDataDir() / TLS_CERT_FILE_NAME).string();
-    string privateKeyFile  = (GetDataDir() / TLS_KEY_FILE_NAME).string();
+#ifdef USE_TLS
 
-    if ((tlsCtx = SSL_CTX_new (TLS_server_method())))
+static int TLSCertVerificationCallback(int preverify_ok, X509_STORE_CTX *chainContext)
+{
+    //If verify_callback always returns 1, the TLS/SSL handshake will not be terminated with respect to verification failures and the connection will be established.
+    return 1;
+}
+
+static SSL_CTX* TLSInitCtx(
+                    TLSContextType ctxType,
+                    const boost::filesystem::path &privateKeyFile,
+                    const boost::filesystem::path &certificateFile,
+                    const std::vector<boost::filesystem::path> &trustedDirs)
+{
+    if (!boost::filesystem::exists(privateKeyFile)  ||
+        !boost::filesystem::exists(certificateFile))
+        return NULL;
+
+    bool bInitialized = false;
+    SSL_CTX *tlsCtx = NULL;
+
+    if ((tlsCtx = SSL_CTX_new(ctxType == serverContext ? TLS_server_method() : TLS_client_method())))
     {
         SSL_CTX_set_mode(tlsCtx, SSL_MODE_AUTO_RETRY);
-        SSL_CTX_set_verify(tlsCtx, SSL_VERIFY_NONE, NULL);
 
-        if (SSL_CTX_use_certificate_file(tlsCtx, certificateFile.c_str(), SSL_FILETYPE_PEM) > 0)
+        int rootCertsNum    = LoadDefaultRootCertificates(tlsCtx);
+        int trustedPathsNum = 0;
+
+        for (boost::filesystem::path trustedDir : trustedDirs)
         {
-            if (SSL_CTX_use_PrivateKey_file(tlsCtx, privateKeyFile.c_str(), SSL_FILETYPE_PEM) > 0)
+            if (SSL_CTX_load_verify_locations(tlsCtx, NULL, trustedDir.string().c_str()) == 1)
+                trustedPathsNum++;
+        }
+
+        if (rootCertsNum == 0 && trustedPathsNum == 0)
+            LogPrintf("TLS: WARNING: %s: %s: failed to set up verified certificates. It will be impossible to verify peer certificates. \n", __FILE__, __func__);
+
+        SSL_CTX_set_verify(tlsCtx, SSL_VERIFY_PEER, TLSCertVerificationCallback);
+
+        if (SSL_CTX_use_certificate_file(tlsCtx, certificateFile.string().c_str(), SSL_FILETYPE_PEM) > 0)
+        {
+            if (SSL_CTX_use_PrivateKey_file(tlsCtx, privateKeyFile.string().c_str(), SSL_FILETYPE_PEM) > 0)
             {
                 if (SSL_CTX_check_private_key(tlsCtx))
                     bInitialized = true;
                 else
-                    LogPrintf("ERROR: %s: %s: private key does not match the certificate public key\n", __FILE__, __func__);
+                    LogPrintf("TLS: ERROR: %s: %s: private key does not match the certificate public key\n", __FILE__, __func__);
             }
             else
-                LogPrintf("ERROR: %s: %s: failed to use privateKey file\n", __FILE__, __func__);
+                LogPrintf("TLS: ERROR: %s: %s: failed to use privateKey file\n", __FILE__, __func__);
         }
         else
         {
-            LogPrintf("ERROR: %s: %s: failed to use certificate file\n", __FILE__, __func__);
+            LogPrintf("TLS: ERROR: %s: %s: failed to use certificate file\n", __FILE__, __func__);
             ERR_print_errors_fp(stderr);
         }
     }
     else
-        LogPrintf("ERROR: %s: %s: failed to create TLS server context\n", __FILE__, __func__);
+        LogPrintf("TLS: ERROR: %s: %s: failed to create TLS context\n", __FILE__, __func__);
 
     if (!bInitialized)
     {
@@ -2466,18 +2437,7 @@ SSL_CTX* InitServerTLSCtx()
     return tlsCtx;
 }
 
-SSL_CTX* InitClientTLSCtx()
-{
-    SSL_CTX *tlsCtx = SSL_CTX_new (TLS_client_method());
-
-    SSL_CTX_set_mode(tlsCtx, SSL_MODE_AUTO_RETRY);
-    SSL_CTX_set_verify(tlsCtx, SSL_VERIFY_NONE, NULL);
-
-    return tlsCtx;
-}
-
-
-bool InitializeTLS()
+static bool TLSInitialize()
 {
     bool bInitializationStatus = false;
 
@@ -2486,26 +2446,84 @@ bool InitializeTLS()
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms(); // OpenSSL_add_ssl_algorithms() always returns "1", so it is safe to discard the return value.
 
+    namespace fs = boost::filesystem;
+    fs::path certFile = GetArg("-tlscertpath", "");
+    if (!fs::exists(certFile))
+            certFile = (GetDataDir() / TLS_CERT_FILE_NAME);
+
+    fs::path privKeyFile = GetArg("-tlskeypath", "");
+    if (!fs::exists(privKeyFile))
+            privKeyFile = (GetDataDir() / TLS_KEY_FILE_NAME);
+
+    std::vector<fs::path> trustedDirs;
+    fs::path trustedDir = GetArg("-tlstrustdir", "");
+    if (fs::exists(trustedDir))
+        // Use only the specified trusted directory
+        trustedDirs.push_back(trustedDir);
+    else
+        // If specified directory can't be used, then setting the default trusted directories
+        trustedDirs = GetDefaultTrustedDirectories();
+
+    for (fs::path dir : trustedDirs)
+        LogPrintf("TLS: trusted directory '%s' will be used\n", dir.c_str());
+
     // Initialization of the server and client contexts
     //
-    if ((tls_ctx_server = InitServerTLSCtx()))
+    if ((tls_ctx_server = TLSInitCtx(serverContext, privKeyFile, certFile, trustedDirs)))
     {
-        if ((tls_ctx_client = InitClientTLSCtx()))
+        if ((tls_ctx_client = TLSInitCtx(clientContext, privKeyFile, certFile, trustedDirs)))
         {
-            DBGPRINT("TLS: contexts are initialized\n");
+            LogPrint("net", "TLS: contexts are initialized\n");
             bInitializationStatus = true;
         }
         else
         {
-            LogPrintf("ERROR: %s: %s: failed to initialize TLS client context\n", __FILE__, __func__);
+            LogPrintf("TLS: ERROR: %s: %s: failed to initialize TLS client context\n", __FILE__, __func__);
             SSL_CTX_free (tls_ctx_server);
         }
     }
     else
-        LogPrintf("ERROR: %s: %s: failed to initialize TLS server context\n", __FILE__, __func__);
+        LogPrintf("TLS: ERROR: %s: %s: failed to initialize TLS server context\n", __FILE__, __func__);
 
     return bInitializationStatus;
 }
+
+static bool TLSPrepareCredentials()
+{
+    boost::filesystem::path
+            defaultKeyPath (GetDataDir() / TLS_KEY_FILE_NAME),
+            defaultCertPath(GetDataDir() / TLS_CERT_FILE_NAME);
+
+    CredentialsStatus credStatus =
+            VerifyCredentials(
+                    boost::filesystem::path(GetArg("-tlskeypath",  defaultKeyPath.string())),
+                    boost::filesystem::path(GetArg("-tlscertpath", defaultCertPath.string())),
+                    GetArg("-tlskeypwd",""));
+
+    bool bPrepared = (credStatus == credOk);
+
+    if (!bPrepared)
+    {
+        if (!mapArgs.count("-tlskeypath") && !mapArgs.count("-tlscertpath"))
+        {
+            // Default paths were used
+            //
+            if (credStatus == credAbsent)
+            {
+                // Generate new credentials (key and self-signed certificate on it) only if credentials were absent previously
+                //
+                bPrepared = GenerateCredentials(
+                                    defaultKeyPath,
+                                    defaultCertPath,
+                                    GetArg("-tlskeypwd",""));
+            }
+        }
+    }
+
+    return bPrepared;
+}
+
+#endif // USE_TLS
 
 void StartNode(boost::thread_group& threadGroup, CScheduler& scheduler)
 {
@@ -2533,22 +2551,22 @@ void StartNode(boost::thread_group& threadGroup, CScheduler& scheduler)
     Discover(threadGroup);
 
 #ifdef USE_TLS
-    
-    if (!PrepareCredentials(GetDataDir()))
+
+    if (!TLSPrepareCredentials())
     {
-        LogPrintf("ERROR: %s: %s: Credentials weren't loaded. Node can't be started.\n", __FILE__, __func__);
+        LogPrintf("TLS: ERROR: %s: %s: Credentials weren't loaded. Node can't be started.\n", __FILE__, __func__);
         return;
     }
-    
-    if (!InitializeTLS())
+
+    if (!TLSInitialize())
     {
-        LogPrintf("ERROR: %s: %s: OpenSSL initialization failed. Node can't be started.\n", __FILE__, __func__);
+        LogPrintf("TLS: ERROR: %s: %s: TLS initialization failed. Node can't be started.\n", __FILE__, __func__);
         return;
     }
 #else
     LogPrintf("TLS is not used!\n");
 #endif
-    
+
     //
     // Start threads
     //
@@ -2577,7 +2595,7 @@ void StartNode(boost::thread_group& threadGroup, CScheduler& scheduler)
     // Clean pools of addresses for non-TLS connections
     threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, "poolscleaner", &ThreadNonTLSPoolsCleaner));
 #endif
-    
+
     // Dump network addresses
     scheduler.scheduleEvery(&DumpAddresses, DUMP_ADDRESSES_INTERVAL);
 }
@@ -2905,17 +2923,17 @@ CNode::~CNode()
 {
     // No need to make a lock on cs_hSocket, because before deletion CNode object is removed from the vNodes vector, so any other thread hasn't access to it.
     // Removal is synchronized with read and write routines, so all of them will be completed to this moment.
-    
+
     if (hSocket != INVALID_SOCKET)
     {
         if (ssl)
         {
             WaitFor(sslShutdown, hSocket, ssl, (DEFAULT_CONNECT_TIMEOUT / 1000));
-            
+
             SSL_free(ssl);
             ssl = NULL;
         }
-        
+
         CloseSocket(hSocket);
     }
 
