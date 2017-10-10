@@ -404,7 +404,7 @@ bool ValidatePeerCertificate(SSL *ssl)
     }
     else
     {
-        LogPrintf ("TLS: ERROR: Peer does not have certificate\n");
+        LogPrint("net", "TLS: Peer does not have certificate\n");
         bIsOk = false;
     }
     return bIsOk;
